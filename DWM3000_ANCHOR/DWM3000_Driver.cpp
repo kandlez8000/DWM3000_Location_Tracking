@@ -1,17 +1,16 @@
 #include "DWM3000_Driver.h"
 #include "DWM3000_registers.h"
 
+uint16_t DWM3000Class::ACTIVE_ANTENNA_DELAY = DWM3000Class::DEFAULT_ANTENNA_DELAY;
+
 // Initialize the global instance of the radio
 DWM3000Class DWM3000;
 
-// SPI Setup
-#define RST_PIN 27
-#define CHIP_SELECT_PIN 4
-
-static int ANTENNA_DELAY = 16350;
-int led_status = 0;
-int destination = 0x0; // Default Values for Destination and Sender IDs
-int sender = 0x0;
+// Initialize the static class variables
+uint8_t DWM3000Class::sender = 0x00;
+uint8_t DWM3000Class::destination = 0x00;
+bool DWM3000Class::DEBUG_OUTPUT = true; // Set to false to quiet the serial monitor
+int led_status = 0; // This can stay global since it's only used locally for the LEDs
 
 // Implementation of DWM3000Class methods
 void DWM3000Class::spiSelect(uint8_t cs)
@@ -34,6 +33,7 @@ void DWM3000Class::begin()
 void DWM3000Class::init()
 {
 
+   uint32_t start1 = millis();
    if (!checkForDevID())
    {
        Serial.println("[ERROR] Dev ID is wrong! Aborting!");
@@ -44,16 +44,25 @@ void DWM3000Class::init()
 
    while (!checkForIDLE())
    {
-       Serial.println("[WARNING] IDLE FAILED (stage 1)");
+       if (millis() - start1 > 2000) { // 2 second timeout
+           Serial.println("[FATAL] IDLE FAILED (stage 1) - TIMEOUT!");
+           break; 
+       }
+       Serial.println("[WARNING] Waiting for IDLE (stage 1)...");
        delay(100);
    }
 
    softReset();
    delay(200);
+   uint32_t start2 = millis();
 
    while (!checkForIDLE())
    {
-       Serial.println("[WARNING] IDLE FAILED (stage 2)");
+       if (millis() - start2 > 2000) {
+           Serial.println("[FATAL] IDLE FAILED (stage 2) - TIMEOUT!");
+           break;
+       }
+       Serial.println("[WARNING] Waiting for IDLE (stage 2)...");
        delay(100);
    }
 
@@ -255,7 +264,7 @@ void DWM3000Class::writeSysConfig()
 
    write(0x0E, 0x02, 0x01); // Enable full CIA diagnostics to get signal strength information
 
-   setTXAntennaDelay(ANTENNA_DELAY); // set default antenna delay
+   setTXAntennaDelay(ACTIVE_ANTENNA_DELAY); // set default antenna delay
 }
 
 void DWM3000Class::configureAsTX()
@@ -271,33 +280,47 @@ void DWM3000Class::setupGPIO()
 
 void DWM3000Class::ds_sendFrame(int stage)
 {
-   setMode(1);
-   write(0x14, 0x01, sender & 0xFF);
-   write(0x14, 0x02, destination & 0xFF);
-   write(0x14, 0x03, stage & 0x7);
-   setFrameLength(4);
-   TXInstantRX();
+    // 1. Wipe the status register clean before starting a new transmission!
+    clearSystemStatus();
 
-   bool error = true;
-   for (int i = 0; i < 50; i++)
-   {
-       if (sentFrameSucc())
-       {
-           error = false;
-           break;
-       }
-   };
-   if (error)
-   {
-       Serial.println("[ERROR] Could not send frame successfully!");
-   }
+    // 2. Build the payload
+    setMode(1);
+    write(0x14, 0x01, sender & 0xFF);
+    write(0x14, 0x02, destination & 0xFF);
+    write(0x14, 0x03, stage & 0x7);
+    setFrameLength(4);
+    
+    // 3. Fire the transmission
+    TXInstantRX();
+
+    // 4. Safely poll for success without starving the ESP32 watchdog
+    bool error = true;
+    for (int i = 0; i < 50; i++)
+    {
+        if (sentFrameSucc())
+        {
+            error = false;
+            break;
+        }
+        // Actually give the radio time to physically transmit the payload
+        delayMicroseconds(100); 
+    }
+    
+    if (error)
+    {
+        Serial.println("[ERROR] Could not send frame successfully!");
+    }
 }
 
 void DWM3000Class::ds_sendRTInfo(int t_roundB, int t_replyB)
 {
+   // The hardware wipe we added earlier
+   clearSystemStatus();
+
    setMode(1);
-   write(0x14, 0x01, destination & 0xFF);
-   write(0x14, 0x02, sender & 0xFF);
+   // FIXED: Sender and Destination are now in the correct payload bytes!
+   write(0x14, 0x01, sender & 0xFF);
+   write(0x14, 0x02, destination & 0xFF);
    write(0x14, 0x03, 4);
    write(0x14, 0x04, t_roundB);
    write(0x14, 0x08, t_replyB);
@@ -419,7 +442,7 @@ void DWM3000Class::setFrameLength(int frameLen)
 
 void DWM3000Class::setTXAntennaDelay(int delay)
 {
-   ANTENNA_DELAY = delay;
+   ACTIVE_ANTENNA_DELAY = delay;
    write(0x01, 0x04, delay);
 }
 
@@ -435,13 +458,18 @@ void DWM3000Class::setDestinationID(int destID)
 
 int DWM3000Class::receivedFrameSucc()
 {
-   int sys_stat = read(GEN_CFG_AES_LOW_REG, 0x44);
+   uint32_t sys_stat = read32(GEN_CFG_AES_LOW_REG, 0x44);
+   
    if ((sys_stat & SYS_STATUS_FRAME_RX_SUCC) > 0)
    {
+       // Fix: Write 1 to clear the RX success bit!
+       write32(GEN_CFG_AES_LOW_REG, 0x44, SYS_STATUS_FRAME_RX_SUCC);
        return 1;
    }
    else if ((sys_stat & SYS_STATUS_RX_ERR) > 0)
    {
+       // Fix: Write 1 to clear the RX error bit!
+       write32(GEN_CFG_AES_LOW_REG, 0x44, SYS_STATUS_RX_ERR);
        return 2;
    }
    return 0;
@@ -449,9 +477,13 @@ int DWM3000Class::receivedFrameSucc()
 
 int DWM3000Class::sentFrameSucc()
 {
-   int sys_stat = read(GEN_CFG_AES_LOW_REG, 0x44);
+   // Use our new Explicit-Width API!
+   uint32_t sys_stat = read32(GEN_CFG_AES_LOW_REG, 0x44);
+   
    if ((sys_stat & SYS_STATUS_FRAME_TX_SUCC) == SYS_STATUS_FRAME_TX_SUCC)
    {
+       // Fix: Write 1 to clear the TX success bit!
+       write32(GEN_CFG_AES_LOW_REG, 0x44, SYS_STATUS_FRAME_TX_SUCC);
        return 1;
    }
    return 0;
@@ -546,9 +578,18 @@ float DWM3000Class::getTempInC()
 {
    write(0x07, 0x34, 0x04);
    write(0x08, 0x00, 0x01);
+   
+   // FIX: Added timeout and yield to prevent ESP32 crash
+   uint32_t start = millis();
    while (!(read(0x08, 0x04) & 0x01))
    {
-   };
+       if (millis() - start > 50) { // 50ms timeout
+           Serial.println("[ERROR] Temperature read timeout!");
+           break; 
+       }
+       yield(); // Feed the watchdog so the ESP32 doesn't panic
+   }
+   
    int res = read(0x08, 0x08);
    res = (res & 0xFF00) >> 8;
    int otp_temp = readOTP(0x09) & 0xFF;
@@ -575,26 +616,27 @@ unsigned long long DWM3000Class::readTXTimestamp()
 
 uint32_t DWM3000Class::write(int base, int sub, uint32_t data, int dataLen)
 {
-   return readOrWriteFullAddress(base, sub, data, dataLen, 1);
+    // Route the data to the perfectly sized explicit function
+    if (dataLen == 1) write8((uint8_t)base, (uint16_t)sub, (uint8_t)data);
+    else if (dataLen == 2) write16((uint8_t)base, (uint16_t)sub, (uint16_t)data);
+    else write32((uint8_t)base, (uint16_t)sub, data);
+    return 0;
 }
 
 uint32_t DWM3000Class::write(int base, int sub, uint32_t data)
 {
-   return readOrWriteFullAddress(base, sub, data, 0, 1);
+    // If no length was provided, safely default to 32-bit
+    write32((uint8_t)base, (uint16_t)sub, data);
+    return 0;
 }
 
 uint32_t DWM3000Class::read(int base, int sub)
 {
-   uint32_t tmp;
-   tmp = readOrWriteFullAddress(base, sub, 0, 0, 0);
-   if (DEBUG_OUTPUT)
-       Serial.println("");
-   return tmp;
-}
-
-uint8_t DWM3000Class::read8bit(int base, int sub)
-{
-   return (uint8_t)(read(base, sub) >> 24);
+    // Route the read request to the new 32-bit explicit reader
+    uint32_t tmp = read32((uint8_t)base, (uint16_t)sub);
+    if (DEBUG_OUTPUT)
+        Serial.println("");
+    return tmp;
 }
 
 uint32_t DWM3000Class::readOTP(uint8_t addr)
@@ -625,7 +667,7 @@ void DWM3000Class::prepareDelayedTX()
 {
    long long rx_ts = readRXTimestamp();
    uint32_t exact_tx_timestamp = (long long)(rx_ts + TRANSMIT_DELAY) >> 8;
-   long long calc_tx_timestamp = ((rx_ts + TRANSMIT_DELAY) & ~TRANSMIT_DIFF) + ANTENNA_DELAY;
+   long long calc_tx_timestamp = ((rx_ts + TRANSMIT_DELAY) & ~TRANSMIT_DIFF) + ACTIVE_ANTENNA_DELAY;
    uint32_t reply_delay = calc_tx_timestamp - rx_ts;
 
     /*
@@ -699,7 +741,8 @@ void DWM3000Class::hardReset()
 
 void DWM3000Class::clearSystemStatus()
 {
-   write(GEN_CFG_AES_LOW_REG, 0x44, 0x3F7FFFFF);
+   // Writes 1s to almost every flag in the status register to wipe it completely clean
+   write32(GEN_CFG_AES_LOW_REG, 0x44, 0x3F7FFFFF);
 }
 
 void DWM3000Class::pullLEDHigh(int led)
@@ -807,119 +850,73 @@ void DWM3000Class::setBitHigh(int reg_addr, int sub_addr, int shift)
 
 void DWM3000Class::writeFastCommand(int cmd)
 {
-   if (DEBUG_OUTPUT)
-       Serial.print("[INFO] Executing short command: ");
-   int header = 0;
-   header = header | 0x1;
-   header = header | (cmd & 0x1F) << 1;
-   header = header | 0x80;
-   if (DEBUG_OUTPUT)
-       Serial.println(header, BIN);
-   int header_arr[] = {header};
-   sendBytes(header_arr, 1, 0);
+    if (DEBUG_OUTPUT)
+        Serial.print("[INFO] Executing short command: ");
+
+    // 1. Build the Fast Command byte (Bit 0: 1, Bits 1-5: Command, Bit 7: 1)
+    uint8_t fast_cmd_byte = 0;
+    fast_cmd_byte |= 0x01;              // Set Bit 0 (Required for Fast Command)
+    fast_cmd_byte |= (cmd & 0x1F) << 1; // Set Bits 1-5 (The command itself)
+    fast_cmd_byte |= 0x80;              // Set Bit 7 (Write bit)
+
+    if (DEBUG_OUTPUT)
+        Serial.println(fast_cmd_byte, BIN);
+
+    // 2. Direct transfer using the new engine
+    // We pass the address of our byte, tell it the length is 1, 
+    // and set the RX parameters to nullptr/0 because we aren't reading anything back.
+    spiTxRx(&fast_cmd_byte, 1, nullptr, 0);
 }
 
-uint32_t DWM3000Class::readOrWriteFullAddress(uint32_t base, uint32_t sub, uint32_t data, uint32_t dataLen, uint32_t readWriteBit)
-{
-   uint32_t header = 0x00;
-   if (readWriteBit)
-       header = header | 0x80;
-   header = header | ((base & 0x1F) << 1);
-   if (sub > 0)
-   {
-       header = header | 0x40;
-       header = header << 8;
-       header = header | ((sub & 0x7F) << 2);
-   }
-   uint32_t header_size = header > 0xFF ? 2 : 1;
-   uint32_t res = 0;
-   if (!readWriteBit)
-   {
-       int headerArr[header_size];
-       if (header_size == 1)
-       {
-           headerArr[0] = header;
-       }
-       else
-       {
-           headerArr[0] = (header & 0xFF00) >> 8;
-           headerArr[1] = header & 0xFF;
-       }
-       res = (uint32_t)sendBytes(headerArr, header_size, 4);
-       return res;
-   }
-   else
-   {
-       uint32_t payload_bytes = 0;
-       if (dataLen == 0)
-       {
-           if (data > 0)
-           {
-               uint32_t payload_bits = countBits(data);
-               payload_bytes = (payload_bits - (payload_bits % 8)) / 8;
-               if ((payload_bits % 8) > 0)
-               {
-                   payload_bytes++;
-               }
-           }
-           else
-           {
-               payload_bytes = 1;
-           }
-       }
-       else
-       {
-           payload_bytes = dataLen;
-       }
-       int payload[header_size + payload_bytes];
-       if (header_size == 1)
-       {
-           payload[0] = header;
-       }
-       else
-       {
-           payload[0] = (header & 0xFF00) >> 8;
-           payload[1] = header & 0xFF;
-       }
-       for (int i = 0; i < payload_bytes; i++)
-       {
-           payload[header_size + i] = (data >> i * 8) & 0xFF;
-       }
-       res = (uint32_t)sendBytes(payload, 2 + payload_bytes, 0);
-       return res;
-   }
+size_t DWM3000Class::buildHeader(uint8_t* hdr, uint8_t base, uint16_t sub, bool isWrite) {
+  uint8_t b0 = (isWrite ? 0x80 : 0x00) | ((base & 0x1F) << 1);
+  if (sub == 0) {
+    hdr[0] = b0;
+    return 1;
+  }
+  b0 |= 0x40;
+  hdr[0] = b0;
+  if (sub <= 0x7F) {
+    hdr[1] = (uint8_t)sub;
+    return 2;
+  }
+  hdr[1] = 0x80 | (uint8_t)(sub & 0x7F);
+  hdr[2] = (uint8_t)(sub >> 7);
+  return 3;
 }
 
-uint32_t DWM3000Class::sendBytes(int b[], int lenB, int recLen)
-{
-   digitalWrite(CHIP_SELECT_PIN, LOW);
-   for (int i = 0; i < lenB; i++)
-   {
-       SPI.transfer(b[i]);
-   }
-   int rec;
-   uint32_t val, tmp;
-   if (recLen > 0)
-   {
-       for (int i = 0; i < recLen; i++)
-       {
-           tmp = SPI.transfer(0x00);
-           if (i == 0)
-           {
-               val = tmp;
-           }
-           else
-           {
-               val |= (uint32_t)tmp << 8 * i;
-           }
-       }
-   }
-   else
-   {
-       val = 0;
-   }
-   digitalWrite(CHIP_SELECT_PIN, HIGH);
-   return val;
+uint32_t DWM3000Class::spiTxRx(const uint8_t* tx, size_t txLen, uint8_t* rx, size_t rxLen) {
+  SPI.beginTransaction(SPISettings(UWB_SPI_HZ, MSBFIRST, SPI_MODE0));
+  digitalWrite(CHIP_SELECT_PIN, LOW); // Change this pin name if necessary!
+
+  for (size_t i = 0; i < txLen; i++) {
+    SPI.transfer(tx[i]);
+  }
+  for (size_t i = 0; i < rxLen; i++) {
+    rx[i] = SPI.transfer(0x00);
+  }
+
+  digitalWrite(CHIP_SELECT_PIN, HIGH);
+  SPI.endTransaction();
+  return 0;
+}
+
+void DWM3000Class::writeBytes(uint8_t base, uint16_t sub, const uint8_t* data, size_t len) {
+  uint8_t hdr[3];
+  size_t hs = buildHeader(hdr, base, sub, true);
+  
+  // Use VLA for perfect memory sizing of the payload
+  uint8_t buf[hs + len]; 
+  memcpy(buf, hdr, hs);
+  memcpy(buf + hs, data, len);
+
+  spiTxRx(buf, hs + len, nullptr, 0);
+}
+
+void DWM3000Class::readBytes(uint8_t base, uint16_t sub, uint8_t* out, size_t len) {
+  uint8_t hdr[3];
+  size_t hs = buildHeader(hdr, base, sub, false);
+  spiTxRx(hdr, hs, out, len);
 }
 
 void DWM3000Class::clearAONConfig()
@@ -931,11 +928,6 @@ void DWM3000Class::clearAONConfig()
    delay(1);
 }
 
-unsigned int DWM3000Class::countBits(unsigned int number)
-{
-   return (int)log2(number) + 1;
-}
-
 int DWM3000Class::checkForDevID()
 {
    int res = read(GEN_CFG_AES_LOW_REG, NO_OFFSET);
@@ -945,4 +937,60 @@ int DWM3000Class::checkForDevID()
        return 0;
    }
    return 1;
+}
+
+void DWM3000Class::write8(uint8_t base, uint16_t sub, uint8_t v) {
+  writeBytes(base, sub, &v, 1);
+}
+
+void DWM3000Class::write16(uint8_t base, uint16_t sub, uint16_t v) {
+  uint8_t b[2] = { (uint8_t)(v & 0xFF), (uint8_t)(v >> 8) };
+  writeBytes(base, sub, b, 2);
+}
+
+void DWM3000Class::write32(uint8_t base, uint16_t sub, uint32_t v) {
+  uint8_t b[4] = {
+    (uint8_t)(v & 0xFF),
+    (uint8_t)((v >> 8) & 0xFF),
+    (uint8_t)((v >> 16) & 0xFF),
+    (uint8_t)((v >> 24) & 0xFF),
+  };
+  writeBytes(base, sub, b, 4);
+}
+
+uint8_t DWM3000Class::read8bit(int base, int sub)
+{
+    // Directly use your new explicit 8-bit hardware reader!
+    return read8((uint8_t)base, (uint16_t)sub);
+}
+
+uint32_t DWM3000Class::read32(uint8_t base, uint16_t sub) {
+  uint8_t b[4] = {0};
+  readBytes(base, sub, b, 4);
+  return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+}
+
+uint32_t DWM3000Class::read(int base, int sub, int len)
+{
+    uint8_t buf[4] = {0, 0, 0, 0}; // Initialize with zeros to prevent garbage data
+    
+    // Safety check: cap the read at 4 bytes to prevent buffer overflows
+    int safe_len = (len > 4) ? 4 : (len > 0 ? len : 1); 
+    
+    // Use our low-level engine to grab the exact number of bytes requested
+    readBytes((uint8_t)base, (uint16_t)sub, buf, safe_len);
+    
+    // Safely reconstruct the integer (Little-Endian)
+    uint32_t tmp = (uint32_t)buf[0] | ((uint32_t)buf[1] << 8) | ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24);
+    
+    if (DEBUG_OUTPUT)
+        Serial.println("");
+        
+    return tmp;
+}
+
+uint8_t DWM3000Class::read8(uint8_t base, uint16_t sub) {
+  uint8_t b = 0;
+  readBytes(base, sub, &b, 1);
+  return b;
 }

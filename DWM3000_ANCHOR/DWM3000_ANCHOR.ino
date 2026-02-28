@@ -3,10 +3,6 @@
 #include "DWM3000_Driver.h"
 #include "DWM3000_registers.h"
 
-// SPI Setup
-#define RST_PIN 27
-#define CHIP_SELECT_PIN 4
-
 // Set to 1 for Anchor 1, 2 for Anchor 2
 #define ANCHOR_ID 2
 #define RESPONSE_TIMEOUT_MS 60 // Maximum time to wait for a response
@@ -23,7 +19,7 @@ static long long rx = 0;
 static long long tx = 0;
 
 // Initial Radio Configuration
-int config[] = {
+uint8_t config[7] = {
    CHANNEL_5,         // Channel
    PREAMBLE_128,      // Preamble Length
    9,                 // Preamble Code (Same for RX and TX!)
@@ -101,13 +97,20 @@ void loop()
     t_roundB = 0;
     t_replyB = 0;
 
-    if (rx_status = DWM3000.receivedFrameSucc())
+    rx_status = DWM3000.receivedFrameSucc(); // Read and wipe the hardware flag ONCE
+    if (rx_status)
     {
       DWM3000.clearSystemStatus();
       if (rx_status == 1)
       { 
         if (DWM3000.getDestinationID() == ANCHOR_ID)
         {
+          // --- ISSUE 4A FIX: LOCK ONTO THE TAG ---
+          // The Anchor just got pinged. Immediately set the sender as our new destination!
+          int tagId = DWM3000.getSenderID();
+          DWM3000.setDestinationID(tagId);
+          // ---------------------------------------
+
           if (DWM3000.ds_isErrorFrame())
           {
             curr_stage = 0;
@@ -147,7 +150,7 @@ void loop()
       DWM3000.standardRX();
       last_ranging_time = millis(); // Reset watchdog
     }
-    break;
+  break;
 
   case 1: // Ranging received. Sending response
     DWM3000.ds_sendFrame(2);

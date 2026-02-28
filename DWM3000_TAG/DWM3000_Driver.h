@@ -4,7 +4,7 @@
 #include <SPI.h>
 #include "DWM3000_registers.h" // Brings in your hardware hex dictionary
 
-extern int config[];
+extern uint8_t config[7];
 
 class DWM3000Class
 {
@@ -17,7 +17,7 @@ public:
    static void configureAsTX();
    static void setupGPIO();
 
-   // Fast Commands
+    // Fast Commands
    static void writeFastCommand(int cmd);
 
    // Double-Sided Ranging
@@ -99,21 +99,45 @@ public:
    static void printRoundTripInformation();
    static void printDouble(double val, unsigned int precision, bool linebreak);
 
+   // --- New Explicit-Width SPI API ---
+   static void write8(uint8_t base, uint16_t sub, uint8_t v);
+   static void write16(uint8_t base, uint16_t sub, uint16_t v);
+   static void write32(uint8_t base, uint16_t sub, uint32_t v);
+
+   static uint8_t read8(uint8_t base, uint16_t sub);
+   static uint32_t read32(uint8_t base, uint16_t sub);
+   static uint32_t read(int base, int sub, int len);      
+
 private:
+   static constexpr uint32_t UWB_SPI_HZ = 8000000;
+   static constexpr uint8_t CHIP_SELECT_PIN = 4;
+   static constexpr uint8_t RST_PIN = 27;
+
+   
+   // Default Calibration 
+   static constexpr uint16_t DEFAULT_ANTENNA_DELAY = 16350;
+
+   static uint16_t ACTIVE_ANTENNA_DELAY;
+   static uint8_t sender;
+   static uint8_t destination;
+   static bool DEBUG_OUTPUT;
+
    // Single Bit Settings
    static void setBit(int reg_addr, int sub_addr, int shift, bool b);
    static void setBitLow(int reg_addr, int sub_addr, int shift);
    static void setBitHigh(int reg_addr, int sub_addr, int shift);
 
    // SPI Interaction
-   static uint32_t readOrWriteFullAddress(uint32_t base, uint32_t sub, uint32_t data, uint32_t data_len, uint32_t readWriteBit);
-   static uint32_t sendBytes(int b[], int lenB, int recLen);
+   // --- New Low-Level SPI Engines ---
+   static size_t buildHeader(uint8_t* hdr, uint8_t base, uint16_t sub, bool isWrite);
+   static uint32_t spiTxRx(const uint8_t* tx, size_t txLen, uint8_t* rx, size_t rxLen);
+   static void writeBytes(uint8_t base, uint16_t sub, const uint8_t* data, size_t len);
+   static void readBytes(uint8_t base, uint16_t sub, uint8_t* out, size_t len);
 
    // Soft Reset Helper Method
    static void clearAONConfig();
 
    // Other Helper Methods
-   static unsigned int countBits(unsigned int number);
    static int checkForDevID();
 };
 

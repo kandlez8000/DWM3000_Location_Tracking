@@ -5,10 +5,6 @@
 #include "DWM3000_Driver.h"
 #include "DWM3000_registers.h"
 
-// SPI Setup
-#define RST_PIN 27
-#define CHIP_SELECT_PIN 4
-
 // Scalable Anchor Configuration
 #define NUM_ANCHORS 4 // 
 #define TAG_ID 10
@@ -40,7 +36,7 @@ esp_now_peer_info_t peerInfo;
 //  --- ESP-NOW Setup ---
 
 // Initial Radio Configuration
-int config[] = {
+uint8_t config[7] = {
    CHANNEL_5,         // Channel
    PREAMBLE_128,      // Preamble Length
    9,                 // Preamble Code (Same for RX and TX!)
@@ -434,29 +430,14 @@ void loop() {
         currentAnchor->signal_strength = DWM3000.getSignalStrength();
         currentAnchor->fp_signal_strength = DWM3000.getFirstPathSignalStrength();
 
+        // Update the median filter array
         updateFilteredDistance(*currentAnchor);
 
-        // 1. Print current distances (Now safely inside Case 4!)
-        printAllDistances();
-
-        // 2. Send ESP-NOW ONLY when the array is fully updated!
-        if (current_anchor_index == NUM_ANCHORS - 1) 
-        {
-            myData.tag_id = TAG_ID;
-            for(int i = 0; i < NUM_ANCHORS; i++) {
-                myData.distances[i] = anchors[i].filtered_distance;
-            }
-            esp_now_send(gatewayAddress, (uint8_t *) &myData, sizeof(myData));
-         }
-
-         // 3. Switch to next anchor
+        // Let your brilliantly designed helper function handle the printing, 
+        // the ESP-NOW transmission, the ALOHA delay, and the target switching!
         finishAnchorCycle();
-       
-        // 4. ALOHA Random backoff to prevent tags from shouting over each other
-        if (current_anchor_index == 0) {
-           delay(random(50, 150)); 
-       }
-       break;
+        
+        break;
     } // End of Case 4
 
     default:
