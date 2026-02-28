@@ -1,0 +1,221 @@
+# Issue 1B
+# Fix subaddressing for sub >= 0x80
+# Add proper extended subaddress handling (3-byte header) or otherwise implement the correct DW3000 header format.
+# WRONG!! --> header |= ((sub & 0x7F) << 2);
+# That throws away bit 7 (and everything above), so 0x80 becomes 0x00 and you talk to the wrong register.
+# static size_t buildHeader(uint8_t* hdr, uint8_t base, uint16_t sub, bool isWrite)
+{
+  // Byte 0: [7]=write, [6]=subaddr present, [5:1]=base reg (5 bits), [0]=0
+  uint8_t b0 = (isWrite ? 0x80 : 0x00) | ((base & 0x1F) << 1);
+
+  if (sub == 0) {
+    hdr[0] = b0;
+    return 1;
+  }
+
+  b0 |= 0x40;        // subaddress present
+  hdr[0] = b0;
+
+  if (sub <= 0x7F) {
+    hdr[1] = (uint8_t)sub;     // 2-byte header
+    return 2;
+  }
+
+  // extended subaddress (3-byte header)
+  hdr[1] = 0x80 | (uint8_t)(sub & 0x7F);  // bit7 indicates extension
+  hdr[2] = (uint8_t)(sub >> 7);
+  return 3;
+}
+
+# Issue 1C
+# Stop “auto-guessing” write payload size from countBits(data)
+#Implement explicit-width access:
+#write8 / write16 / write32
+#read(base, sub, len) and use len=1 when reading bytes
+# This part is the main culprit:
+# payload_bytes = countBits(data)
+# static constexpr uint32_t UWB_SPI_HZ = 8000000; // adjust if needed
+
+static uint32_t spiTxRx(const uint8_t* tx, size_t txLen, uint8_t* rx, size_t rxLen)
+{
+  SPI.beginTransaction(SPISettings(UWB_SPI_HZ, MSBFIRST, SPI_MODE0));
+  digitalWrite(CHIP_SELECT_PIN, LOW);
+
+  for (size_t i = 0; i < txLen; i++) {
+    SPI.transfer(tx[i]);
+  }
+
+  for (size_t i = 0; i < rxLen; i++) {
+    rx[i] = SPI.transfer(0x00);
+  }
+
+  digitalWrite(CHIP_SELECT_PIN, HIGH);
+  SPI.endTransaction();
+  return 0;
+}
+
+static void writeBytes(uint8_t base, uint16_t sub, const uint8_t* data, size_t len)
+{
+  uint8_t hdr[3];
+  size_t hs = buildHeader(hdr, base, sub, true);
+
+  uint8_t buf[3 + 8];                 // header + up to 8 bytes payload (adjust if needed)
+  if (len > 8) return;                // or handle dynamically
+
+  memcpy(buf, hdr, hs);
+  memcpy(buf + hs, data, len);
+
+  spiTxRx(buf, hs + len, nullptr, 0);
+}
+
+# HELPERS writeBytes() and readBytes()
+static void readBytes(uint8_t base, uint16_t sub, uint8_t* out, size_t len)
+{
+  uint8_t hdr[3];
+  size_t hs = buildHeader(hdr, base, sub, false);
+  spiTxRx(hdr, hs, out, len);
+}
+
+#result
+
+static void write8(uint8_t base, uint16_t sub, uint8_t v)
+{
+  writeBytes(base, sub, &v, 1);
+}
+
+static void write16(uint8_t base, uint16_t sub, uint16_t v)
+{
+  uint8_t b[2] = { (uint8_t)(v & 0xFF), (uint8_t)(v >> 8) };
+  writeBytes(base, sub, b, 2);
+}
+
+static void write32(uint8_t base, uint16_t sub, uint32_t v)
+{
+  uint8_t b[4] = {
+    (uint8_t)(v & 0xFF),
+    (uint8_t)((v >> 8) & 0xFF),
+    (uint8_t)((v >> 16) & 0xFF),
+    (uint8_t)((v >> 24) & 0xFF),
+  };
+  writeBytes(base, sub, b, 4);
+}
+
+static uint32_t read32(uint8_t base, uint16_t sub)
+{
+  uint8_t b[4] = {0};
+  readBytes(base, sub, b, 4);
+  return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+}
+
+static uint8_t read8(uint8_t base, uint16_t sub)
+{
+  uint8_t b = 0;
+  readBytes(base, sub, &b, 1);
+  return b;
+}
+
+
+
+
+
+
+
+
+
+
+# Issue 1D
+# Fix read8bit()
+# but your read assembly is little-endian.
+return (uint8_t)(read(base, sub) >> 24);
+
+# change to this
+return (uint8_t)(read(base, sub, 1) & 0xFF);
+
+# Issue 1E
+# Clear TX/RX status bits properly (prevents false “success”)
+# sentFrameSucc() can return true forever if you never clear TXFRS
+# Clear relevant SYS_STATUS bits after handling, and before starting a TX in ds_sendFrame().
+
+
+# Issue 1F
+# Right now it swaps IDs compared to ds_sendFrame().
+# Make it:
+# byte 0x01 = sender
+# byte 0x02 = destination
+
+# Issue 1E
+# Poll loops should yield / have timeouts
+# A few loops can hang or starve ESP32.
+# Add delayMicroseconds()/yield() or millis() timeouts.
+
+# Issue 2A
+# driver.h (API mismatch + fragility)
+# Replace extern int config[] with a sized, typed config or struct
+# extern uint8_t config[7];
+
+# Issue 2B
+# Update SPI prototypes to byte buffers
+# Replace: sendBytes(int b[], ...)
+# sendBytes(const uint8_t* tx, size_t txLen, size_t rxLen)
+
+# Issue 2C
+# Add read(base, sub, len) to support correct 1-byte reads
+
+# Issue 3A
+# registers.h (safety + correctness improvements)
+# Convert untyped #define to typed constexpr (recommended) Especially for masks and timing constants.
+
+# Issue 3B
+# Rename timing constants to reflect real meaning
+# For example:
+# NS_UNIT is ~4.006 ns (not 1 ns) — likely “timestamp >> 8 unit”.
+# Rename so you don’t mix units in ToF math.
+
+# Issue 4A
+# Anchor .ino (protocol/session fixes)
+# Set destination to the tag that pinged you (critical)
+# int tagId = DWM3000.getSenderID();
+# DWM3000.setDestinationID(tagId);
+
+# Issue 4B
+# Use 32/64-bit types for timestamp deltas
+# uint32_t for t_replyB/t_roundB, uint64_t for timestamps.
+
+# Issue 4C
+# Validate sender/destination/stage on each step
+# Avoid accepting packets meant for other anchors/tags.
+
+# Issue 4D
+# Prefer reading IDs/stage before clearing SYS_STATUS
+# Safer ordering for debugging and avoids edge cases.
+
+# Issue 5A
+# Tag .ino (filtering + correctness + cleanup)
+# Validate sender/destination/stage on RX (critical)
+# In stage 1 and stage 3 waits, require:
+# dst == TAG_ID & src == currentAnchorId
+# stage matches expected (2 then 4)
+# not error frame
+
+# Issue 5B
+# Use 32/64-bit types for timing
+# int can overflow.
+# uint32_t t_roundA/t_replyA, uint64_t rx/tx.
+
+# Issue 5C
+# Remove duplicate ESP-NOW send / duplicate random delays
+# Right now you send/print in both case 4 and finishAnchorCycle().
+# Keep it in one place (recommend: only in finishAnchorCycle() when last anchor).
+
+# Issue 5D
+# Replace float temp[size]; VLA in median filter
+# Use a fixed buffer of FILTER_SIZE.
+
+# The “do these first” order
+# 1. driver.cpp: write length bug + subaddressing + explicit widths + clear TXFRS
+# 2. ds_sendRTInfo() ID order
+# 3. Anchor: set destination to tag ID
+# 4. Tag/Anchor: enforce src/dst/stage checks
+# 5. Types (uint32_t/uint64_t)
+# 6. Cleanup (ESP-NOW double send, VLA, unit naming)
+
