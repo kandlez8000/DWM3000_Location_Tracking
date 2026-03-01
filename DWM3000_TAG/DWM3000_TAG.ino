@@ -59,11 +59,11 @@ struct AnchorData
    int anchor_id; // Anchor ID
 
    // Timing measurements
-   int t_roundA = 0;
-   int t_replyA = 0;
-   long long rx = 0;
-   long long tx = 0;
-   int clock_offset = 0;
+    uint32_t t_roundA = 0;
+    uint32_t t_replyA = 0;
+    uint64_t rx = 0;
+    uint64_t tx = 0;
+    int32_t clock_offset = 0;
 
    // Distance measurements
    float distance = 0;
@@ -181,7 +181,7 @@ void updateFilteredDistance(AnchorData &data)
 }
 
 // Debug print function
-void printDebugInfo(int anchor, long long rx, long long tx, int t_round, int t_reply, int clock_offset)
+void printDebugInfo(int anchor, uint64_t rx, uint64_t tx, uint32_t t_round, uint32_t t_reply, int32_t clock_offset)
 {
    Serial.print("Anchor ");
    Serial.print(anchor);
@@ -349,73 +349,103 @@ void loop() {
        timeout_timer = millis(); // Start the stopwatch
        break;
 
-   case 1: // Await first response
-       if (rx_status = DWM3000.receivedFrameSucc())
-       {
-           DWM3000.clearSystemStatus();
-           if (rx_status == 1)
-           {
-               if (DWM3000.ds_isErrorFrame())
-               {
-                   finishAnchorCycle();
-               }
-               else if (DWM3000.ds_getStage() != 2)
-               {
-                   DWM3000.ds_sendErrorFrame();
-                   finishAnchorCycle();
-               }
-               else
-               {
-                   curr_stage = 2;
-                   timeout_timer = millis(); // Reset stopwatch
-               }
-           }
-       }
-       // The Escape Hatch
-       else if (millis() - timeout_timer > 50) 
-       {
-            DWM3000.writeFastCommand(0x00);
-           DWM3000.clearSystemStatus();
-           currentAnchor->filtered_distance = 0.0; // clear this line if this isn't the issue
-           finishAnchorCycle(); 
-       }
-       break;
+   case 1: // Await first response (expect stage 2 from current anchor to this tag)
+{
+  rx_status = DWM3000.receivedFrameSucc();
+
+  if (rx_status != 0)
+  {
+    int stage = DWM3000.ds_getStage();
+    int src   = DWM3000.getSenderID();
+    int dst   = DWM3000.getDestinationID();
+    bool err  = DWM3000.ds_isErrorFrame();
+
+    if (rx_status == 1 && !err && stage == 2 && src == currentAnchorId && dst == TAG_ID)
+    {
+      curr_stage = 2;
+      timeout_timer = millis();
+    }
+    else if (rx_status == 1 && err && src == currentAnchorId && dst == TAG_ID)
+    {
+      finishAnchorCycle();
+    }
+    else if (rx_status == 2)
+    {
+      // RX error: flush and keep listening
+  DWM3000.writeFastCommand(0x00);  // TRX off
+  DWM3000.clearSystemStatus();
+  DWM3000.standardRX();           // <-- IMPORTANT: turn RX back on
+  timeout_timer = millis();       // optional: give it fresh time to recover
+    }
+    else
+    {
+      // Stray/late/wrong packet: ignore (prevents desync)
+    }
+  }
+  else if (millis() - timeout_timer > 50)
+  {
+    DWM3000.writeFastCommand(0x00);
+    DWM3000.clearSystemStatus();
+    currentAnchor->filtered_distance = 0.0f;
+    finishAnchorCycle();
+  }
+}
+break;
 
    case 2: // Response received. Send second ranging
        currentAnchor->rx = DWM3000.readRXTimestamp();
        DWM3000.ds_sendFrame(3);
 
-       currentAnchor->t_roundA = currentAnchor->rx - currentAnchor->tx;
+       currentAnchor->t_roundA = (uint32_t)(currentAnchor->rx - currentAnchor->tx);
        currentAnchor->tx = DWM3000.readTXTimestamp();
-       currentAnchor->t_replyA = currentAnchor->tx - currentAnchor->rx;
+       currentAnchor->t_replyA = (uint32_t)(currentAnchor->tx - currentAnchor->rx);
+
 
        curr_stage = 3;
        timeout_timer = millis(); // Reset stopwatch
        break;
 
-   case 3: // Await second response
-       if (rx_status = DWM3000.receivedFrameSucc())
-       {
-           DWM3000.clearSystemStatus();
-           if (rx_status == 1 && !DWM3000.ds_isErrorFrame())
-           {
-                currentAnchor->clock_offset = DWM3000.getRawClockOffset();
-                curr_stage = 4;
-           }
-           else
-           {
-                finishAnchorCycle();
-           }
-       }
-       // The Escape Hatch
-       else if (millis() - timeout_timer > 50) 
-       {
-            DWM3000.writeFastCommand(0x00);
-           DWM3000.clearSystemStatus();
-           currentAnchor->filtered_distance = 0.0;
-           finishAnchorCycle();
-       }
-       break;
+    case 3: // Await second response (expect stage 4 from current anchor to this tag)
+{
+  rx_status = DWM3000.receivedFrameSucc();
+
+  if (rx_status != 0)
+  {
+    int stage = DWM3000.ds_getStage();
+    int src   = DWM3000.getSenderID();
+    int dst   = DWM3000.getDestinationID();
+    bool err  = DWM3000.ds_isErrorFrame();
+
+    if (rx_status == 2)
+    {
+      // RX error: flush and keep listening (do NOT advance or abandon)
+    DWM3000.writeFastCommand(0x00);
+    DWM3000.clearSystemStatus();
+    DWM3000.standardRX();           // <-- IMPORTANT
+    timeout_timer = millis();       // optional
+    }
+    else if (rx_status == 1 && !err && stage == 4 && src == currentAnchorId && dst == TAG_ID)
+    {
+      // Good stage-4 from the correct anchor addressed to us
+      currentAnchor->clock_offset = (int32_t)DWM3000.getRawClockOffset();
+      curr_stage = 4;
+    }
+    else
+    {
+      // Wrong/stray packet: abandon this anchor attempt and move on
+      finishAnchorCycle();
+    }
+  }
+  else if (millis() - timeout_timer > 50)
+  {
+    // Timeout: reset radio state and move on
+    DWM3000.writeFastCommand(0x00);
+    DWM3000.clearSystemStatus();
+    currentAnchor->filtered_distance = 0.0f;
+    finishAnchorCycle();
+  }
+}
+break;
 
     case 4: // Response received. Calculating results
     {

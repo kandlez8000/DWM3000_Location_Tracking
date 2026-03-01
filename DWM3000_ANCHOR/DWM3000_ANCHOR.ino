@@ -11,12 +11,13 @@
 unsigned long last_ranging_time = 0;
 //int retry_count = 0; //commenting out for now, it could be causing issues with desync not being able to recover
 static int rx_status;
-static int tx_status;
 static int curr_stage = 0;
-static int t_roundB = 0;
-static int t_replyB = 0;
-static long long rx = 0;
-static long long tx = 0;
+static int sessionTagId = -1;
+static uint32_t t_roundB = 0;
+static uint32_t t_replyB = 0;
+static uint64_t rx = 0;
+static uint64_t tx = 0;
+
 
 // Initial Radio Configuration
 uint8_t config[7] = {
@@ -80,132 +81,121 @@ void setup()
 
 void loop()
 {
-  if (DWM3000.receivedFrameSucc() == 1 && DWM3000.ds_getStage() == 1 && DWM3000.getDestinationID() == ANCHOR_ID)
-  {
-    // Reset session if new ranging request arrives out of sequence
-    if (curr_stage != 0)
-    {
-      curr_stage = 0;
-      t_roundB = 0;
-      t_replyB = 0;
-    }
-  }
+  
 
   switch (curr_stage)
   {
-  case 0: // Await ranging
-    t_roundB = 0;
-    t_replyB = 0;
+  case 0: // Await ranging (expect stage 1 addressed to this anchor)
+{
+  rx_status = DWM3000.receivedFrameSucc();
 
-    rx_status = DWM3000.receivedFrameSucc(); // Read and wipe the hardware flag ONCE
-    if (rx_status)
-    {
-      DWM3000.clearSystemStatus();
-      if (rx_status == 1)
-      { 
-        if (DWM3000.getDestinationID() == ANCHOR_ID)
-        {
-          // --- ISSUE 4A FIX: LOCK ONTO THE TAG ---
-          // The Anchor just got pinged. Immediately set the sender as our new destination!
-          int tagId = DWM3000.getSenderID();
-          DWM3000.setDestinationID(tagId);
-          // ---------------------------------------
+  if (rx_status != 0)
+  {
+    int stage = DWM3000.ds_getStage();
+    int src   = DWM3000.getSenderID();
+    int dst   = DWM3000.getDestinationID();
+    bool err  = DWM3000.ds_isErrorFrame();
 
-          if (DWM3000.ds_isErrorFrame())
-          {
-            curr_stage = 0;
-            DWM3000.standardRX();
-          }
-          else if (DWM3000.ds_getStage() != 1)
-          {
-            DWM3000.ds_sendErrorFrame();
-            DWM3000.standardRX();
-            curr_stage = 0;
-          }
-          else
-          {
-            curr_stage = 1;
-            last_ranging_time = millis(); // Start the 60ms stopwatch for Case 1!
-          }
-        }
-        else
-        {
-          DWM3000.standardRX();
-        }
-      }
-      else
-      {
-        // OUT OF BOUNDS FIX: Flush hardware and turn the antenna back on!
-        DWM3000.clearSystemStatus();
-        DWM3000.writeFastCommand(0x00); // Force TRX Off
-        DWM3000.standardRX();           // Turn the ear back on!
-      }
-    }
-    // THE WATCHDOG RECOVERY FIX
-    else if (millis() - last_ranging_time > 1000)
+    if (rx_status == 2)
     {
-      // If 1 full second passes with zero valid packets, reboot the radio listener!
       DWM3000.writeFastCommand(0x00);
       DWM3000.clearSystemStatus();
       DWM3000.standardRX();
-      last_ranging_time = millis(); // Reset watchdog
+      break;
     }
-  break;
+
+    if (rx_status == 1 && !err && stage == 1 && dst == ANCHOR_ID)
+    {
+      sessionTagId = src;
+      DWM3000.setDestinationID(sessionTagId);
+
+      // Reset per-session timing only when a new session starts
+      t_roundB = 0;
+      t_replyB = 0;
+
+      curr_stage = 1;
+      last_ranging_time = millis();
+    }
+    else if (rx_status == 1 && err && stage == 7 && dst == ANCHOR_ID)
+    {
+      curr_stage = 0;
+      DWM3000.standardRX();
+    }
+    else
+    {
+      DWM3000.standardRX();
+    }
+  }
+  else if (millis() - last_ranging_time > 1000)
+  {
+    DWM3000.writeFastCommand(0x00);
+    DWM3000.clearSystemStatus();
+    DWM3000.standardRX();
+    last_ranging_time = millis();
+  }
+}
+break;
 
   case 1: // Ranging received. Sending response
     DWM3000.ds_sendFrame(2);
+    DWM3000.standardRX();
 
     rx = DWM3000.readRXTimestamp();
     tx = DWM3000.readTXTimestamp();
 
-    t_replyB = tx - rx;
+    t_replyB = (uint32_t)(tx - rx);
     curr_stage = 2;
     last_ranging_time = millis(); // Reset timeout timer for Case 2
+    Serial.printf("Stage1 from tag=%d to anchor=%d\n", src, dst);
     break;
 
-  case 2: // Awaiting response
-    if (rx_status = DWM3000.receivedFrameSucc())
+  case 2: // Await stage 3 from the same tag (sessionTagId) addressed to this anchor
+{
+  rx_status = DWM3000.receivedFrameSucc();
+
+  if (rx_status != 0)
+  {
+    int stage = DWM3000.ds_getStage();
+    int src   = DWM3000.getSenderID();
+    int dst   = DWM3000.getDestinationID();
+    bool err  = DWM3000.ds_isErrorFrame();
+
+    if (rx_status == 2)
     {
-      DWM3000.clearSystemStatus();
-      if (rx_status == 1)
-      { 
-        if (DWM3000.ds_isErrorFrame())
-        {
-          curr_stage = 0;
-          DWM3000.standardRX();
-        }
-        else if (DWM3000.ds_getStage() != 3)
-        {
-          DWM3000.ds_sendErrorFrame();
-          DWM3000.standardRX();
-          curr_stage = 0;
-        }
-        else
-        {
-          curr_stage = 3;
-        }
-      }
-      else
-      {
-        // OUT OF BOUNDS FIX
-        DWM3000.clearSystemStatus();
-        DWM3000.writeFastCommand(0x00); 
-        DWM3000.standardRX(); 
-        curr_stage = 0;
-      }
-    }
-    else if (millis() - last_ranging_time > RESPONSE_TIMEOUT_MS) // Uses the 60ms limit!
-    {
-      curr_stage = 0;
       DWM3000.writeFastCommand(0x00);
       DWM3000.clearSystemStatus();
       DWM3000.standardRX();
+      curr_stage = 0;
+      sessionTagId = -1;
+      break;
     }
-    break;
+
+    if (rx_status == 1 && !err && stage == 3 && dst == ANCHOR_ID && src == sessionTagId)
+    {
+      curr_stage = 3;
+    }
+    else
+    {
+      // Wrong packet: reset this attempt
+      curr_stage = 0;
+      sessionTagId = -1;
+      DWM3000.standardRX();
+    }
+  }
+  else if (millis() - last_ranging_time > RESPONSE_TIMEOUT_MS)
+  {
+    curr_stage = 0;
+    sessionTagId = -1;
+    DWM3000.writeFastCommand(0x00);
+    DWM3000.clearSystemStatus();
+    DWM3000.standardRX();
+  }
+}
+break;
 
   case 3: // Second response received. Sending information frame
     rx = DWM3000.readRXTimestamp();
-    t_roundB = rx - tx;
+    t_roundB = (uint32_t)(rx - tx);
     DWM3000.ds_sendRTInfo(t_roundB, t_replyB);
 
     curr_stage = 0;
